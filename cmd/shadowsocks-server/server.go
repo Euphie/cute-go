@@ -18,7 +18,7 @@ import (
 
 	"golang.org/x/net/websocket"
 
-	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
+	ss "github.com/euphie/cute-go/shadowsocks"
 )
 
 var (

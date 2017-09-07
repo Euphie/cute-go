@@ -2,10 +2,13 @@ package shadowsocks
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+
+	"golang.org/x/net/websocket"
 )
 
 const (
@@ -52,6 +55,45 @@ func RawAddr(addr string) (buf []byte, err error) {
 	buf[1] = byte(hostLen) // host address length  followed by host address
 	copy(buf[2:], host)
 	binary.BigEndian.PutUint16(buf[2+hostLen:2+hostLen+2], uint16(port))
+	return
+}
+
+// Header 协议头部
+type Header struct {
+	Service    string
+	Type       int
+	Version    uint8
+	Encryption uint8
+	UserName   string
+	Password   string
+}
+
+func DialWithHeader(header *Header, server string, cipher *Cipher) (c *Conn, err error) {
+	var url = "ws://" + server + "/euphie"
+	ws, err := websocket.Dial(url, "", "http://www.euphie.me")
+	if err != nil {
+		return
+	}
+	c = NewConn(ws, cipher)
+	// if cipher.ota {
+	// 	if c.enc == nil {
+	// 		if _, err = c.initEncrypt(); err != nil {
+	// 			return
+	// 		}
+	// 	}
+	// 	// since we have initEncrypt, we must send iv manually
+	// 	conn.Write(cipher.iv)
+	// 	rawaddr[0] |= OneTimeAuthMask
+	// 	rawaddr = otaConnectAuth(cipher.iv, cipher.key, rawaddr)
+	// }
+	buf := make([]byte, 0)
+	rawaddr, _ := json.Marshal(header)
+	buf = append(buf, uint8(0))
+	buf = append(buf, rawaddr[0:]...)
+	if _, err = ws.Write(buf); err != nil {
+		c.Close()
+		return nil, err
+	}
 	return
 }
 

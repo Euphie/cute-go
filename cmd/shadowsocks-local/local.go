@@ -75,7 +75,7 @@ func handShake(conn net.Conn) (err error) {
 	return
 }
 
-func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
+func getHeader(conn net.Conn) (header *ss.Header, err error) {
 	const (
 		idVer   = 0
 		idCmd   = 1
@@ -92,9 +92,9 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		lenIPv6   = 3 + 1 + net.IPv6len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv6 + 2port
 		lenDmBase = 3 + 1 + 1 + 2           // 3 + 1addrType + 1addrLen + 2port, plus addrLen
 	)
+	var n int
 	// refer to getRequest in server.go for why set buffer size to 263
 	buf := make([]byte, 263)
-	var n int
 	ss.SetReadTimeout(conn)
 	// read till we get possible domain length field
 	if n, err = io.ReadAtLeast(conn, buf, idDmLen+1); err != nil {
@@ -110,14 +110,19 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		return
 	}
 
+	// 第一帧就是协议头，协议头的第一个字节代表版本号，整个头部不要超过1K
+	header = new(ss.Header)
 	reqLen := -1
 	switch buf[idType] {
 	case typeIPv4:
 		reqLen = lenIPv4
+		header.Type = 0
 	case typeIPv6:
 		reqLen = lenIPv6
+		header.Type = 1
 	case typeDm:
 		reqLen = int(buf[idDmLen]) + lenDmBase
+		header.Type = 2
 	default:
 		err = errAddrType
 		return
@@ -134,21 +139,23 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		return
 	}
 
-	rawaddr = buf[idType:reqLen]
-
-	if debug {
-		switch buf[idType] {
-		case typeIPv4:
-			host = net.IP(buf[idIP0 : idIP0+net.IPv4len]).String()
-		case typeIPv6:
-			host = net.IP(buf[idIP0 : idIP0+net.IPv6len]).String()
-		case typeDm:
-			host = string(buf[idDm0 : idDm0+buf[idDmLen]])
-		}
-		port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
-		host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	host := ""
+	switch buf[idType] {
+	case typeIPv4:
+		host = net.IP(buf[idIP0 : idIP0+net.IPv4len]).String()
+	case typeIPv6:
+		host = net.IP(buf[idIP0 : idIP0+net.IPv6len]).String()
+	case typeDm:
+		host = string(buf[idDm0 : idDm0+buf[idDmLen]])
 	}
+	port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
+	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
 
+	header.Service = host
+	header.Version = 0
+	header.Encryption = 0
+	header.Password = servers.password
+	header.UserName = servers.username
 	return
 }
 
@@ -160,9 +167,13 @@ type ServerCipher struct {
 var servers struct {
 	srvCipher []*ServerCipher
 	failCnt   []int // failed connection count
+	username  string
+	password  string
 }
 
 func parseServerConfig(config *ss.Config) {
+	servers.username = config.UserName
+	servers.password = config.Password
 	hasPort := func(s string) bool {
 		_, port, err := net.SplitHostPort(s)
 		if err != nil {
@@ -237,27 +248,23 @@ func parseServerConfig(config *ss.Config) {
 	return
 }
 
-func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn, err error) {
+func connectToServer(serverId int, header *ss.Header) (remote *ss.Conn, err error) {
 	se := servers.srvCipher[serverId]
-	remote, err = ss.DialWithRawAddr(rawaddr, se.server, se.cipher.Copy())
+	remote, err = ss.DialWithHeader(header, se.server, se.cipher.Copy())
 	if err != nil {
-		log.Println("error connecting to shadowsocks server:", err)
+		debug.Printf("error connecting to shadowsocks server:", err)
 		const maxFailCnt = 30
 		if servers.failCnt[serverId] < maxFailCnt {
 			servers.failCnt[serverId]++
 		}
 		return nil, err
 	}
-	debug.Printf("connected to %s via %s\n", addr, se.server)
+	debug.Printf("connected to %s via %s\n", header.Service, se.server)
 	servers.failCnt[serverId] = 0
 	return
 }
 
-// Connection to the server in the order specified in the config. On
-// connection failure, try the next server. A failed server will be tried with
-// some probability according to its fail count, so we can discover recovered
-// servers.
-func createServerConn(rawaddr []byte, addr string) (remote *ss.Conn, err error) {
+func createServerConn(header *ss.Header) (remote *ss.Conn, err error) {
 	const baseFailCnt = 20
 	n := len(servers.srvCipher)
 	skipped := make([]int, 0)
@@ -267,19 +274,19 @@ func createServerConn(rawaddr []byte, addr string) (remote *ss.Conn, err error) 
 			skipped = append(skipped, i)
 			continue
 		}
-		remote, err = connectToServer(i, rawaddr, addr)
+		remote, err = connectToServer(i, header)
 		if err == nil {
 			return
 		}
 	}
 	// last resort, try skipped servers, not likely to succeed
 	for _, i := range skipped {
-		remote, err = connectToServer(i, rawaddr, addr)
+		remote, err = connectToServer(i, header)
 		if err == nil {
 			return
 		}
 	}
-	return nil, err
+	return
 }
 
 func handleConnection(conn net.Conn) {
@@ -298,21 +305,18 @@ func handleConnection(conn net.Conn) {
 		log.Println("socks handshake:", err)
 		return
 	}
-	rawaddr, addr, err := getRequest(conn)
+	header, err := getHeader(conn)
 	if err != nil {
 		log.Println("error getting request:", err)
 		return
 	}
-	// Sending connection established message immediately to client.
-	// This some round trip time for creating socks connection with the client.
-	// But if connection failed, the client will get connection reset error.
 	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
 	if err != nil {
 		debug.Println("send connection confirmation:", err)
 		return
 	}
 
-	remote, err := createServerConn(rawaddr, addr)
+	remote, err := createServerConn(header)
 	if err != nil {
 		if len(servers.srvCipher) > 1 {
 			log.Println("Failed connect to all avaiable shadowsocks server")
@@ -325,10 +329,10 @@ func handleConnection(conn net.Conn) {
 		}
 	}()
 
-	go ss.PipeThenClose(conn, remote)
-	ss.PipeThenClose(remote, conn)
+	go ss.PipeThenClose(conn, remote.Conn)
+	ss.PipeThenClose(remote.Conn, conn)
 	closed = true
-	debug.Println("closed connection to", addr)
+	debug.Println("closed connection to", header.Service)
 }
 
 func run(listenAddr string) {
@@ -348,8 +352,8 @@ func run(listenAddr string) {
 }
 
 func enoughOptions(config *ss.Config) bool {
-	return config.Server != nil && config.ServerPort != 0 &&
-		config.LocalPort != 0 && config.Password != ""
+	return config.Server != "" && config.ServerPort != 0 &&
+		config.LocalPort != 0 && config.Password != "" && config.UserName != ""
 }
 
 func main() {
@@ -362,11 +366,12 @@ func main() {
 	flag.BoolVar(&printVer, "version", false, "print version")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
 	flag.StringVar(&cmdServer, "s", "", "server address")
-	flag.StringVar(&cmdLocal, "b", "", "local address, listen only to this address if specified")
+	flag.StringVar(&cmdLocal, "b", "0.0.0.0", "local address, listen only to this address if specified")
+	flag.StringVar(&cmdConfig.UserName, "u", "", "user name")
 	flag.StringVar(&cmdConfig.Password, "k", "", "password")
-	flag.IntVar(&cmdConfig.ServerPort, "p", 0, "server port")
+	flag.IntVar(&cmdConfig.ServerPort, "p", 7777, "server port")
 	flag.IntVar(&cmdConfig.Timeout, "t", 300, "timeout in seconds")
-	flag.IntVar(&cmdConfig.LocalPort, "l", 0, "local socks5 proxy port")
+	flag.IntVar(&cmdConfig.LocalPort, "l", 6666, "local socks5 proxy port")
 	flag.StringVar(&cmdConfig.Method, "m", "", "encryption method, default: aes-256-cfb")
 	flag.BoolVar((*bool)(&debug), "d", false, "print debug message")
 	flag.BoolVar(&cmdConfig.Auth, "A", false, "one time auth")
@@ -411,7 +416,7 @@ func main() {
 	}
 	if len(config.ServerPassword) == 0 {
 		if !enoughOptions(config) {
-			fmt.Fprintln(os.Stderr, "must specify server address, password and both server/local port")
+			fmt.Fprintln(os.Stderr, "must specify server address, user name, password and both server/local port")
 			os.Exit(1)
 		}
 	} else {

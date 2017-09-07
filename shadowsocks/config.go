@@ -22,6 +22,7 @@ type Config struct {
 	Server     interface{} `json:"server"`
 	ServerPort int         `json:"server_port"`
 	LocalPort  int         `json:"local_port"`
+	UserName   string      `json:"user_name"`
 	Password   string      `json:"password"`
 	Method     string      `json:"method"` // encryption method
 	Auth       bool        `json:"auth"`   // one time auth
